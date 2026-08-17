@@ -38,7 +38,7 @@ function isObject<T>(value: T): value is T & object {
 	return objectSchema.safeParse(value).success;
 }
 
-const MCP_PATH = "/mcp";
+const MCP_PATH = "/mcp-v1";
 const MAX_BODY_BYTES = 1_048_576;
 const HTTP_BEARER_TOKEN = "HEVY_MCP_HTTP_BEARER_TOKEN";
 
