@@ -24,7 +24,11 @@ ENV NODE_ENV=production
 WORKDIR /app
 
 COPY --from=build --chown=node:node /app/packages/node/dist/standalone.mjs ./standalone.mjs
+COPY entrypoint.sh ./entrypoint.sh
+
+RUN chmod +x ./entrypoint.sh
 
 USER node
 
-ENTRYPOINT ["node", "/app/standalone.mjs"]
+ENTRYPOINT ["./entrypoint.sh"]
+
