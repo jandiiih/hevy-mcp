@@ -76,6 +76,26 @@ The stored file holds sealed grants: each Hevy API key is encrypted against the
 secret inside the client's own token, so the file alone cannot be used to reach
 anyone's Hevy account.
 
+No extra permission setting is needed. Railway mounts volumes root-owned, which
+an image running as a non-root user cannot write to; Railway's own guidance is
+to set `RAILWAY_RUN_UID=0` and run the whole container as root. This image
+instead starts its entrypoint as root, hands the store directory to the
+unprivileged `node` user, and execs the server as that user, so the server
+never runs with root privileges.
+
+Confirm it worked by reading the deploy log. The server states which mode it is
+in on every start:
+
+```text
+OAuth grants persist at /data/oauth-store.json; clients stay connected across restarts.
+```
+
+If it instead reports `in memory only ... is not writable`, the volume is not
+usable and every redeploy will disconnect connected clients.
+
+Attaching the volume is itself a redeploy, so clients authorized before it
+must reconnect once. From then on the grant survives.
+
 ## 5. Verify the deployment
 
 ```bash
@@ -135,10 +155,10 @@ codex mcp add hevy \
 
 ## Troubleshooting
 
-| Symptom                                         | Cause                                                                          |
-| ----------------------------------------------- | ------------------------------------------------------------------------------ |
-| Claude reports it cannot reach the server       | The domain has no deployment, or `HEVY_MCP_TRANSPORT` is not `http`.           |
-| Every request returns `403 Invalid Host header` | `HEVY_MCP_PUBLIC_URL` does not match the domain Claude is calling.             |
-| Connector disconnects after each deploy         | No volume is attached, so grants are lost. See step 4.                         |
-| `401` even after authorizing                    | The Hevy key behind the grant was rotated. Reconnect the connector.            |
-| Health check fails during deploy                | The service is not listening on Railway's `PORT`. Leave `HEVY_MCP_PORT` unset. |
+| Symptom                                         | Cause                                                                                        |
+| ----------------------------------------------- | -------------------------------------------------------------------------------------------- |
+| Claude reports it cannot reach the server       | The domain has no deployment, or `HEVY_MCP_TRANSPORT` is not `http`.                         |
+| Every request returns `403 Invalid Host header` | `HEVY_MCP_PUBLIC_URL` does not match the domain Claude is calling.                           |
+| Connector disconnects after each deploy         | No volume is attached, or the deploy log reports the store path is not writable. See step 4. |
+| `401` even after authorizing                    | The Hevy key behind the grant was rotated. Reconnect the connector.                          |
+| Health check fails during deploy                | The service is not listening on Railway's `PORT`. Leave `HEVY_MCP_PORT` unset.               |
