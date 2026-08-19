@@ -125,6 +125,7 @@ vi.mock("@modelcontextprotocol/server/stdio", () => ({
 }));
 
 vi.mock("./utils/streamable-http.js", () => ({
+	MCP_PATH: "/mcp",
 	startStreamableHttpServer: testDoubles.startStreamableHttpServer,
 }));
 

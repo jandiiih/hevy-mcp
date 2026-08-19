@@ -1,4 +1,4 @@
-import { randomUUID, timingSafeEqual } from "node:crypto";
+import { createHash, randomUUID, timingSafeEqual } from "node:crypto";
 import {
 	createServer,
 	type IncomingMessage,
@@ -12,6 +12,17 @@ import {
 	createSafeErrorDiagnostic,
 } from "@hevy-mcp/core";
 import type { NodeCliOptions } from "./arguments.js";
+import {
+	applyCorsHeaders,
+	evaluateOrigin,
+	handlePreflight,
+	resolveCorsPolicy,
+	type CorsPolicy,
+	type OriginDecision,
+} from "./http-cors.js";
+import { resolvePublicOrigin } from "./http-public-url.js";
+import type { HevyOAuthProvider } from "./oauth/index.js";
+import { hasCredentialFormat } from "./oauth/index.js";
 import { httpAdmissionRejections, httpSessionEvictions } from "./metrics.js";
 import {
 	runWithMcpSessionContext,
@@ -38,7 +49,15 @@ function isObject<T>(value: T): value is T & object {
 	return objectSchema.safeParse(value).success;
 }
 
-const MCP_PATH = "/mcp-v1";
+/**
+ * The MCP endpoint. `/mcp` is the canonical path that remote clients and the
+ * Cloudflare Worker use; `/mcp-v1` stays served so deployments already
+ * configured against it keep working.
+ */
+export const MCP_PATH = "/mcp";
+const MCP_PATH_ALIASES = [MCP_PATH, "/mcp-v1"] as const;
+/** Liveness endpoint for platform health checks; exposes no account data. */
+const HEALTH_PATH = "/healthz";
 const MAX_BODY_BYTES = 1_048_576;
 const HTTP_BEARER_TOKEN = "HEVY_MCP_HTTP_BEARER_TOKEN";
 
@@ -140,8 +159,39 @@ interface HttpSession {
 	context: McpSessionContext;
 	lifecycleController: AbortController;
 	responses: Set<ServerResponse>;
+	/**
+	 * Opaque identity of whoever initialized this session. Every follow-up
+	 * request must present the same identity, so a leaked session id cannot be
+	 * driven by a different OAuth grant or API key.
+	 */
+	principal: string;
 	idleTimer?: ReturnType<typeof setTimeout>;
 	closed: boolean;
+}
+
+/**
+ * Optional capabilities layered on top of the base transport. They are all
+ * inert unless a caller supplies them, so loopback and Docker deployments
+ * behave exactly as before.
+ */
+export interface HttpServerExtensions {
+	/** When present, the MCP endpoint is guarded by OAuth 2.1. */
+	oauth?: HevyOAuthProvider;
+	/** Origin allowlist for browser clients. Defaults to the built-in list. */
+	cors?: CorsPolicy;
+	/** Public origin behind a proxy; also pins the accepted Host header. */
+	publicOrigin?: string;
+	/**
+	 * Accept a raw Hevy API key as the bearer value. Lets non-browser clients
+	 * skip the OAuth dance on a deployment that has OAuth enabled.
+	 */
+	allowDirectApiKeyBearer?: boolean;
+}
+
+/** Identity and Hevy credential resolved for one request. */
+interface RequestCredential {
+	apiKey: string;
+	principal: string;
 }
 
 export interface HttpServerHandle {
@@ -362,6 +412,14 @@ function closeServer(server: Server): Promise<void> {
 	});
 }
 
+/** Extract the bearer value from an Authorization header, if well-formed. */
+function parseBearer(request: IncomingMessage): string | null {
+	const header = request.headers.authorization;
+	if (!isString(header)) return null;
+	const match = /^Bearer ([^\s,]+)$/iu.exec(header);
+	return match?.[1] ?? null;
+}
+
 function isBearerAuthorized(
 	request: IncomingMessage,
 	token: string | undefined,
@@ -426,11 +484,20 @@ export function isHttpHostAllowed(host: string): boolean {
 	return isLoopbackHost(host);
 }
 
+function requestPathname(request: IncomingMessage): string {
+	return request.url?.split("?", 1)[0] ?? "/";
+}
+
+function isMcpPath(pathname: string): boolean {
+	return MCP_PATH_ALIASES.some((alias) => alias === pathname);
+}
+
 export async function startStreamableHttpServer(
 	options: NodeCliOptions,
 	apiKey: string,
 	createMcpServer: McpServerFactory,
 	configOverrides: Partial<HttpAdmissionConfig> = {},
+	extensions: HttpServerExtensions = {},
 ): Promise<HttpServerHandle> {
 	const config = resolveHttpAdmissionConfig(configOverrides);
 	const wildcard =
@@ -438,10 +505,15 @@ export async function startStreamableHttpServer(
 		options.host === "::" ||
 		options.host === "[::]";
 	const loopback = isLoopbackHost(options.host);
+	const oauth = extensions.oauth;
+	const corsPolicy = extensions.cors ?? resolveCorsPolicy();
+	const configuredOrigin = extensions.publicOrigin;
 	const bearerToken = process.env[HTTP_BEARER_TOKEN];
-	if (!loopback && !bearerToken) {
+	// OAuth authenticates every request against a per-user grant, so it fully
+	// replaces the shared static token as the non-loopback protection.
+	if (!loopback && !bearerToken && !oauth) {
 		throw new Error(
-			`Non-loopback HTTP mode requires ${HTTP_BEARER_TOKEN} to protect the shared Hevy account.`,
+			`Non-loopback HTTP mode requires ${HTTP_BEARER_TOKEN} or OAuth (${"HEVY_MCP_OAUTH"}=1) to protect the shared Hevy account.`,
 		);
 	}
 
@@ -568,31 +640,112 @@ export async function startStreamableHttpServer(
 		sessionId?: string;
 		existingSession?: HttpSession;
 		trackedExistingResponse: boolean;
+		credential: RequestCredential;
+	}
+
+	/** Origin a client used to reach this request, for OAuth metadata URLs. */
+	function publicOriginFor(request: IncomingMessage): string {
+		return (
+			resolvePublicOrigin(request, { configuredOrigin }) ??
+			`http://${options.host}:${expectedPort(options, server)}`
+		);
+	}
+
+	/**
+	 * Behind a proxy the Host header names the public hostname rather than the
+	 * bind address, so the default wildcard check cannot pin it. When a public
+	 * origin is configured, require the Host to match it; that restores DNS
+	 * rebinding protection for a deployment that would otherwise accept any
+	 * hostname.
+	 */
+	function hostHeaderAccepted(request: IncomingMessage): boolean {
+		if (configuredOrigin) {
+			const header = request.headers.host;
+			if (!isString(header)) return false;
+			try {
+				const expectedHostname = new URL(configuredOrigin).hostname;
+				const actual = new URL(`http://${header}`);
+				return (
+					!actual.username &&
+					!actual.password &&
+					actual.pathname === "/" &&
+					!actual.search &&
+					normalizeHost(actual.hostname).toLowerCase() ===
+						normalizeHost(expectedHostname).toLowerCase()
+				);
+			} catch {
+				return false;
+			}
+		}
+		return validateHostHeader(
+			request,
+			hostNamesFor(options),
+			expectedPort(options, server),
+			wildcard,
+		);
+	}
+
+	/**
+	 * Resolve the Hevy credential for a request.
+	 *
+	 * With OAuth on, the key comes from the presented grant, so each session
+	 * acts for the user that authorized it. Without OAuth the server keeps its
+	 * previous single-key behavior behind the loopback or static-token gate.
+	 */
+	function resolveCredential(
+		request: IncomingMessage,
+		response: ServerResponse,
+	): RequestCredential | undefined {
+		if (!oauth) {
+			if (!loopback && !isBearerAuthorized(request, bearerToken)) {
+				writeJson(response, 401, "Authorization required");
+				return undefined;
+			}
+			return { apiKey, principal: "static" };
+		}
+
+		const origin = publicOriginFor(request);
+		const unauthorized = (description: string): undefined => {
+			if (!response.headersSent && !response.destroyed) {
+				response.setHeader(
+					"WWW-Authenticate",
+					oauth.unauthorizedHeader(origin, description),
+				);
+			}
+			writeJson(response, 401, "Authorization required");
+			return undefined;
+		};
+
+		const bearer = parseBearer(request);
+		if (!bearer) return unauthorized("Authorization header is required");
+
+		if (hasCredentialFormat(bearer)) {
+			const result = oauth.authenticateBearer(bearer);
+			if (result.kind === "rejected") return unauthorized(result.reason);
+			return {
+				apiKey: result.grant.apiKey,
+				principal: `grant:${result.grant.grantId}`,
+			};
+		}
+		if (!extensions.allowDirectApiKeyBearer) {
+			return unauthorized("An OAuth access token is required");
+		}
+		// A raw Hevy API key. It is validated upstream when the session's MCP
+		// server is built, so an invalid key fails the initialize call.
+		const digest = createHash("sha256").update(bearer, "utf8").digest("hex");
+		return { apiKey: bearer, principal: `key:${digest}` };
 	}
 
 	function resolveRequestSession(
 		request: IncomingMessage,
 		response: ServerResponse,
 	): RequestSessionResolution | undefined {
-		if (request.url?.split("?", 1)[0] !== MCP_PATH) {
-			writeJson(response, 404, "Not found");
-			return undefined;
-		}
-		if (
-			!validateHostHeader(
-				request,
-				hostNamesFor(options),
-				expectedPort(options, server),
-				wildcard,
-			)
-		) {
+		if (!hostHeaderAccepted(request)) {
 			writeJson(response, 403, "Invalid Host header");
 			return undefined;
 		}
-		if (!loopback && !isBearerAuthorized(request, bearerToken)) {
-			writeJson(response, 401, "Authorization required");
-			return undefined;
-		}
+		const credential = resolveCredential(request, response);
+		if (!credential) return undefined;
 
 		const sessionHeader = request.headers["mcp-session-id"];
 		const sessionId = isString(sessionHeader) ? sessionHeader : undefined;
@@ -607,11 +760,33 @@ export async function startStreamableHttpServer(
 			);
 			return undefined;
 		}
+		if (existingSession && existingSession.principal !== credential.principal) {
+			// The session id is valid but belongs to someone else. Report it as
+			// unknown so the id itself is not confirmed to a probing caller.
+			rejectBeforeBody(
+				request,
+				response,
+				404,
+				"Unknown Mcp-Session-Id.",
+				config.bodyTimeoutMs,
+			);
+			return undefined;
+		}
 		if (existingSession && request.method !== "DELETE") {
 			trackSessionResponse(existingSession, response);
-			return { sessionId, existingSession, trackedExistingResponse: true };
+			return {
+				sessionId,
+				existingSession,
+				trackedExistingResponse: true,
+				credential,
+			};
 		}
-		return { sessionId, existingSession, trackedExistingResponse: false };
+		return {
+			sessionId,
+			existingSession,
+			trackedExistingResponse: false,
+			credential,
+		};
 	}
 
 	interface InitializationReservation {
@@ -691,6 +866,7 @@ export async function startStreamableHttpServer(
 		response: ServerResponse,
 		body: T,
 		reservation: InitializationReservation,
+		credential: RequestCredential,
 	): Promise<void> {
 		const context = createMcpSessionContext(isObject(body) ? body : {}, "http");
 		recordMcpSessionStart(isObject(body) ? body : {}, "http", context);
@@ -723,7 +899,7 @@ export async function startStreamableHttpServer(
 		};
 		try {
 			mcpServer = await createMcpServer({
-				apiKey,
+				apiKey: credential.apiKey,
 				lifecycleSignal: lifecycleController.signal,
 			});
 			if (shuttingDown || lifecycleController.signal.aborted) {
@@ -737,6 +913,7 @@ export async function startStreamableHttpServer(
 				context,
 				lifecycleController,
 				responses: new Set(),
+				principal: credential.principal,
 				closed: false,
 			};
 			pendingSessions.add(session);
@@ -784,6 +961,7 @@ export async function startStreamableHttpServer(
 		body: T,
 		sessionId: string | undefined,
 		reservation: InitializationReservation | undefined,
+		credential: RequestCredential,
 	): Promise<boolean> {
 		if (request.method !== "POST" || !isInitializeRequest(body)) return false;
 		if (sessionId) {
@@ -802,7 +980,13 @@ export async function startStreamableHttpServer(
 			);
 			return true;
 		}
-		await handleInitializedSession(request, response, body, reservation);
+		await handleInitializedSession(
+			request,
+			response,
+			body,
+			reservation,
+			credential,
+		);
 		return true;
 	}
 
@@ -839,12 +1023,65 @@ export async function startStreamableHttpServer(
 		}
 	}
 
+	/**
+	 * Handle everything that is not an MCP exchange: CORS preflight, the health
+	 * probe, OAuth endpoints, and unknown paths. Returns true when the request
+	 * has been answered.
+	 */
+	async function handleNonMcpRequest(
+		request: IncomingMessage,
+		response: ServerResponse,
+		pathname: string,
+		originDecision: OriginDecision,
+	): Promise<boolean> {
+		if (handlePreflight(request, response, originDecision)) return true;
+		if (originDecision.kind === "rejected") {
+			writeJson(response, 403, "Origin not allowed");
+			return true;
+		}
+		if (pathname === HEALTH_PATH) {
+			if (!response.headersSent && !response.destroyed) {
+				response.statusCode = 200;
+				response.setHeader("Content-Type", "application/json");
+				response.setHeader("Cache-Control", "no-store");
+				response.end(JSON.stringify({ status: "ok" }));
+			}
+			return true;
+		}
+		if (oauth?.handlesPath(pathname)) {
+			await oauth.handleRequest(
+				request,
+				response,
+				pathname,
+				publicOriginFor(request),
+			);
+			return true;
+		}
+		if (!isMcpPath(pathname)) {
+			writeJson(response, 404, "Not found");
+			return true;
+		}
+		return false;
+	}
+
 	async function handleRequest(
 		request: IncomingMessage,
 		response: ServerResponse,
 	): Promise<void> {
 		let releaseInitialization: (() => void) | undefined;
 		try {
+			const pathname = requestPathname(request);
+			const originDecision = evaluateOrigin(
+				request,
+				corsPolicy,
+				configuredOrigin,
+			);
+			applyCorsHeaders(response, originDecision);
+			if (
+				await handleNonMcpRequest(request, response, pathname, originDecision)
+			) {
+				return;
+			}
 			const resolution = resolveRequestSession(request, response);
 			if (!resolution) return;
 			const requiresInitialization =
@@ -878,6 +1115,7 @@ export async function startStreamableHttpServer(
 					body,
 					resolution.sessionId,
 					reservation ?? undefined,
+					resolution.credential,
 				)
 			)
 				return;

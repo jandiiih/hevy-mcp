@@ -1,21 +1,24 @@
 #!/bin/sh
+set -eu
 
-# Default values
+# Transport selection. stdio stays the default so `docker run -i` keeps working
+# as an MCP stdio server; hosted platforms set HEVY_MCP_TRANSPORT=http.
 TRANSPORT=${HEVY_MCP_TRANSPORT:-stdio}
 HOST=${HEVY_MCP_HOST:-0.0.0.0}
-PORT=${HEVY_MCP_PORT:-8080}
 
-# Build arguments
-ARGS=""
+# Hosted platforms (Railway, Render, Fly, Heroku) inject the port to listen on
+# as PORT. Prefer it so no per-platform configuration is needed, and fall back
+# to the project-specific variable and then a fixed default.
+PORT=${HEVY_MCP_PORT:-${PORT:-8080}}
+
+set -- /app/standalone.mjs
 
 if [ "$TRANSPORT" != "stdio" ]; then
-  ARGS="$ARGS --transport $TRANSPORT"
+  set -- "$@" --transport "$TRANSPORT"
 fi
 
 if [ "$TRANSPORT" = "http" ]; then
-  ARGS="$ARGS --host $HOST --port $PORT"
+  set -- "$@" --host "$HOST" --port "$PORT"
 fi
 
-# Execute the standalone server with the constructed arguments
-exec node /app/standalone.mjs $ARGS
-
+exec node "$@"
