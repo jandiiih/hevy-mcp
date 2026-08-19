@@ -469,6 +469,70 @@ describe("Node OAuth 2.1 provider", () => {
 		expect(metadata.token_endpoint).toBe(`${publicOrigin}/token`);
 	});
 
+	it("completes consent from a sandboxed browser context", async () => {
+		// Claude renders the consent page in a sandboxed context, so the form
+		// submission carries the opaque origin "null" rather than a nameable one.
+		const { base } = await startServer();
+		const clientId = await registerClient(base);
+		const pkce = createPkce();
+		const authorizeUrl =
+			`${base}/authorize?response_type=code&client_id=${clientId}` +
+			`&redirect_uri=${encodeURIComponent(REDIRECT_URI)}` +
+			`&code_challenge=${pkce.challenge}&code_challenge_method=S256&state=st`;
+		const html = await (await fetch(authorizeUrl)).text();
+		const encoded = /name="oauth_request" value="([^"]+)"/u.exec(html)?.[1];
+
+		const submitted = await fetch(`${base}/authorize`, {
+			method: "POST",
+			headers: {
+				"Content-Type": "application/x-www-form-urlencoded",
+				Origin: "null",
+			},
+			body: new URLSearchParams({
+				oauth_request: encoded as string,
+				hevy_api_key: VALID_KEY,
+			}),
+			redirect: "manual",
+		});
+		expect(submitted.status).toBe(302);
+		// The opaque origin must not be echoed back: doing so would let any
+		// sandboxed document read the redirect carrying the authorization code.
+		expect(submitted.headers.get("access-control-allow-origin")).toBeNull();
+
+		const location = new URL(submitted.headers.get("location") as string);
+		const code = location.searchParams.get("code") as string;
+		const tokens = (await (
+			await exchangeCode(base, clientId, code, pkce.verifier)
+		).json()) as TokenResponse;
+		expect(tokens.access_token.split(":")).toHaveLength(3);
+	});
+
+	it("keeps the opaque-origin exception off the MCP endpoint", async () => {
+		// The exception exists only so the consent form can be submitted. A
+		// sandboxed document must never reach the MCP endpoint through it.
+		const { base } = await startServer();
+		const response = await fetch(`${base}/mcp`, {
+			method: "POST",
+			headers: { "Content-Type": "application/json", Origin: "null" },
+			body: "{}",
+		});
+		expect(response.status).toBe(403);
+	});
+
+	it("still refuses a named origin that is not allowlisted on consent", async () => {
+		const { base } = await startServer();
+		const response = await fetch(`${base}/authorize`, {
+			method: "POST",
+			headers: {
+				"Content-Type": "application/x-www-form-urlencoded",
+				Origin: "https://evil.example",
+			},
+			body: new URLSearchParams({ oauth_request: "x", hevy_api_key: "y" }),
+			redirect: "manual",
+		});
+		expect(response.status).toBe(403);
+	});
+
 	it("refuses to register a redirect URI that is not https or loopback", async () => {
 		const { base } = await startServer();
 		const response = await fetch(`${base}/register`, {

@@ -16,13 +16,14 @@ import {
 	applyCorsHeaders,
 	evaluateOrigin,
 	handlePreflight,
+	isOpaqueOrigin,
 	resolveCorsPolicy,
 	type CorsPolicy,
 	type OriginDecision,
 } from "./http-cors.js";
 import { resolvePublicOrigin } from "./http-public-url.js";
 import type { HevyOAuthProvider } from "./oauth/index.js";
-import { hasCredentialFormat } from "./oauth/index.js";
+import { AUTHORIZE_PATH, hasCredentialFormat } from "./oauth/index.js";
 import { httpAdmissionRejections, httpSessionEvictions } from "./metrics.js";
 import {
 	runWithMcpSessionContext,
@@ -1036,8 +1037,25 @@ export async function startStreamableHttpServer(
 	): Promise<boolean> {
 		if (handlePreflight(request, response, originDecision)) return true;
 		if (originDecision.kind === "rejected") {
-			writeJson(response, 403, "Origin not allowed");
-			return true;
+			// The consent form is submitted from whatever browser context the MCP
+			// client opened the authorization page in, and a sandboxed context
+			// serializes its origin as the opaque value "null". Refusing that would
+			// make the flow impossible to complete from such a client. The
+			// submission is a top-level navigation carrying a user-typed key, and
+			// it receives no CORS headers back, so an opaque-origin document still
+			// cannot read the result. Keep this route-specific: it must never
+			// extend to the MCP endpoint.
+			const isConsentSubmission =
+				oauth !== undefined &&
+				request.method === "POST" &&
+				pathname === AUTHORIZE_PATH;
+			if (!isConsentSubmission || !isOpaqueOrigin(originDecision)) {
+				console.error(
+					`Rejected browser origin ${JSON.stringify(originDecision.origin)} for ${request.method} ${pathname}`,
+				);
+				writeJson(response, 403, "Origin not allowed");
+				return true;
+			}
 		}
 		if (pathname === HEALTH_PATH) {
 			if (!response.headersSent && !response.destroyed) {
