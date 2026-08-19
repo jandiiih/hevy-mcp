@@ -23,12 +23,18 @@ FROM node:24-alpine AS runtime
 ENV NODE_ENV=production
 WORKDIR /app
 
+# su-exec drops privileges after the entrypoint has prepared the writable
+# volume, so the server itself never runs as root.
+RUN apk add --no-cache su-exec
+
 COPY --from=build --chown=node:node /app/packages/node/dist/standalone.mjs ./standalone.mjs
 COPY entrypoint.sh ./entrypoint.sh
 
 RUN chmod +x ./entrypoint.sh
 
-USER node
-
+# Deliberately no USER directive: the entrypoint starts as root only long
+# enough to make an attached volume writable, then execs the server as the
+# unprivileged "node" user. Hosted platforms mount volumes as root, so a
+# container that starts unprivileged cannot use one at all.
 ENTRYPOINT ["./entrypoint.sh"]
 
