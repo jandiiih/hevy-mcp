@@ -119,6 +119,21 @@ export function evaluateOrigin(
 }
 
 /**
+ * Whether a rejected decision is the opaque origin a sandboxed browser context
+ * sends. A document with an opaque origin serializes it as the string "null",
+ * which is not the same as sending no `Origin` at all: it means the request
+ * came from a browser, just one whose origin cannot be named.
+ *
+ * This never grants access on its own. Callers decide, per route, whether an
+ * unnameable browser origin is acceptable, and such a request must not receive
+ * CORS headers back — echoing `Access-Control-Allow-Origin: null` would let any
+ * sandboxed document read the response.
+ */
+export function isOpaqueOrigin(decision: OriginDecision): boolean {
+	return decision.kind === "rejected" && decision.origin === "null";
+}
+
+/**
  * Apply CORS response headers for an allowed origin. `Vary: Origin` keeps any
  * intermediary cache from serving one origin's response to another.
  */
