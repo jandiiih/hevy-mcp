@@ -614,8 +614,11 @@ for that user's sessions. The server exposes:
 
 Access tokens last 7 days and refresh tokens 30 days, matching the Worker.
 Grants live in memory unless `HEVY_MCP_OAUTH_STORE_PATH` points at a durable
-path, so without it a restart requires reconnecting the connector. Because that
-store is per-process, run a single replica.
+path, so without it a restart requires reconnecting the connector. The server
+reports which of the two it is doing on every start, so a volume that is
+attached but not writable is visible in the deploy log rather than surfacing
+later as disconnected clients. Because that store is per-process, run a single
+replica.
 
 Clients that _can_ send a fixed header — Claude Code, Codex, other CLI clients
 — may skip the OAuth flow entirely and present the Hevy API key directly as
