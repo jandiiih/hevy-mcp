@@ -21,4 +21,19 @@ if [ "$TRANSPORT" = "http" ]; then
   set -- "$@" --host "$HOST" --port "$PORT"
 fi
 
+# The server must not run as root. When the container starts as root — which is
+# what makes an attached volume usable, since platforms mount them root-owned —
+# hand the OAuth store directory to the unprivileged user and then drop to it.
+# A container already started unprivileged just runs the server directly.
+if [ "$(id -u)" = "0" ]; then
+  if [ -n "${HEVY_MCP_OAUTH_STORE_PATH:-}" ]; then
+    STORE_DIR=$(dirname "$HEVY_MCP_OAUTH_STORE_PATH")
+    # Best effort: a read-only or otherwise unusable mount must not stop the
+    # server from starting. It reports the degraded state itself at startup.
+    mkdir -p "$STORE_DIR" 2>/dev/null || true
+    chown -R node:node "$STORE_DIR" 2>/dev/null || true
+  fi
+  exec su-exec node node "$@"
+fi
+
 exec node "$@"
