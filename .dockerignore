@@ -6,6 +6,10 @@
 !Dockerfile
 !.dockerignore
 
+# The container entrypoint translates platform environment variables into CLI
+# flags, so the runtime stage cannot be built without it.
+!entrypoint.sh
+
 # Standalone build inputs.
 !package.json
 !package-lock.json
@@ -14,6 +18,8 @@
 !packages/
 !packages/hevy-client/
 !packages/hevy-client/**
+!packages/operations/
+!packages/operations/**
 !packages/core/
 !packages/core/**
 !packages/node/
