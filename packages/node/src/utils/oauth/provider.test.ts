@@ -1,5 +1,8 @@
 import { createHash, randomBytes } from "node:crypto";
+import { mkdtempSync } from "node:fs";
 import { request as httpRequest } from "node:http";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import type { AddressInfo } from "node:net";
 import { McpServer } from "@modelcontextprotocol/server";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -28,6 +31,7 @@ afterEach(async () => {
 interface StartedServer {
 	base: string;
 	apiKeys: string[];
+	close(): Promise<void>;
 }
 
 async function startServer(
@@ -71,7 +75,11 @@ async function startServer(
 	);
 	handles.push(handle);
 	const address = handle.server.address() as AddressInfo;
-	return { base: `http://127.0.0.1:${address.port}`, apiKeys };
+	return {
+		base: `http://127.0.0.1:${address.port}`,
+		apiKeys,
+		close: () => handle.close(),
+	};
 }
 
 async function registerClient(base: string): Promise<string> {
@@ -531,6 +539,75 @@ describe("Node OAuth 2.1 provider", () => {
 			redirect: "manual",
 		});
 		expect(response.status).toBe(403);
+	});
+
+	it("keeps a client authorized across a restart when grants are persisted", async () => {
+		// The deployment case: a redeploy replaces the process. With a persisted
+		// store the client's existing token must keep working, so nobody has to
+		// reconnect the connector after every deploy.
+		const persistencePath = join(
+			mkdtempSync(join(tmpdir(), "hevy-oauth-restart-")),
+			"oauth-store.json",
+		);
+		const first = await startServer({ persistencePath });
+		const clientId = await registerClient(first.base);
+		const pkce = createPkce();
+		const code = await authorize(first.base, clientId, pkce, VALID_KEY);
+		const tokens = (await (
+			await exchangeCode(first.base, clientId, code, pkce.verifier)
+		).json()) as TokenResponse;
+
+		const before = await initializeSession(
+			first.base,
+			`Bearer ${tokens.access_token}`,
+		);
+		expect(before.status).toBe(200);
+		await before.body?.cancel();
+
+		// Tear the process down and bring a fresh one up on the same store.
+		await first.close();
+		const second = await startServer({ persistencePath });
+		expect(second.base).not.toBe(first.base);
+
+		const after = await initializeSession(
+			second.base,
+			`Bearer ${tokens.access_token}`,
+		);
+		expect(after.status).toBe(200);
+		expect(second.apiKeys).toEqual([VALID_KEY]);
+		await after.body?.cancel();
+
+		// Refresh must survive too, or the client is stranded once the access
+		// token ages out.
+		const refreshed = await fetch(`${second.base}/token`, {
+			method: "POST",
+			headers: { "Content-Type": "application/x-www-form-urlencoded" },
+			body: new URLSearchParams({
+				grant_type: "refresh_token",
+				refresh_token: tokens.refresh_token,
+				client_id: clientId,
+			}),
+		});
+		expect(refreshed.status).toBe(200);
+	});
+
+	it("strands a client across a restart when grants are memory-only", async () => {
+		// The contrast that makes the persisted case meaningful.
+		const first = await startServer();
+		const clientId = await registerClient(first.base);
+		const pkce = createPkce();
+		const code = await authorize(first.base, clientId, pkce, VALID_KEY);
+		const tokens = (await (
+			await exchangeCode(first.base, clientId, code, pkce.verifier)
+		).json()) as TokenResponse;
+		await first.close();
+
+		const second = await startServer();
+		const after = await initializeSession(
+			second.base,
+			`Bearer ${tokens.access_token}`,
+		);
+		expect(after.status).toBe(401);
 	});
 
 	it("refuses to register a redirect URI that is not https or loopback", async () => {

@@ -82,16 +82,30 @@ export class OAuthStore {
 	readonly #grants = new Map<string, GrantRecord>();
 	readonly #persistencePath: string | undefined;
 	readonly #now: () => number;
+	#persistenceWritable = false;
 
 	constructor(options: OAuthStoreOptions = {}) {
 		this.#persistencePath = options.persistencePath;
 		this.#now = options.now ?? (() => Date.now());
 		this.#load();
+		// Probe the path once at construction. A store directory that exists but
+		// is not writable by this process — the usual shape of a volume mounted
+		// for a different user — would otherwise only surface much later, as
+		// grants silently failing to survive a restart.
+		if (this.#persistencePath) this.#persistenceWritable = this.#persist();
 	}
 
-	/** Whether records survive a process restart. */
+	/** Whether a persistence path is configured. */
 	get persistent(): boolean {
 		return this.#persistencePath !== undefined;
+	}
+
+	/**
+	 * Whether records actually reach disk. False when no path is configured, or
+	 * when the configured path could not be written.
+	 */
+	get persistenceWritable(): boolean {
+		return this.#persistenceWritable;
 	}
 
 	registerClient(client: ClientRecord): void {
@@ -211,9 +225,9 @@ export class OAuthStore {
 		}
 	}
 
-	#persist(): void {
+	#persist(): boolean {
 		const path = this.#persistencePath;
-		if (!path) return;
+		if (!path) return false;
 		const state = {
 			version: 1 as const,
 			clients: [...this.#clients.values()],
@@ -225,13 +239,15 @@ export class OAuthStore {
 			const temporaryPath = `${path}.tmp`;
 			writeFileSync(temporaryPath, JSON.stringify(state), { mode: 0o600 });
 			renameSync(temporaryPath, path);
+			return true;
 		} catch (error) {
 			// Persistence is a convenience; losing it must not break authorization.
 			console.error(
-				`OAuth store could not be persisted: ${
+				`OAuth store could not be persisted at ${path}: ${
 					error instanceof Error ? error.name : "unknown error"
 				}`,
 			);
+			return false;
 		}
 	}
 }

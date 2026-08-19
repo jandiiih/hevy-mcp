@@ -456,6 +456,19 @@ export async function runServer(): Promise<void> {
 				`Starting MCP server in HTTP mode at ${options.host}:${options.port}${MCP_PATH}` +
 					(oauthConfig.enabled ? " with OAuth 2.1 enabled" : ""),
 			);
+			if (store) {
+				// State plainly whether an authorized client stays authorized across
+				// a restart. Silence here previously made a misconfigured volume
+				// indistinguishable from a working one until a redeploy dropped
+				// everyone's grant.
+				console.error(
+					store.persistenceWritable
+						? `OAuth grants persist at ${oauthConfig.storePath}; clients stay connected across restarts.`
+						: store.persistent
+							? `OAuth grants are in memory only: ${oauthConfig.storePath} is not writable. Clients must reconnect after every restart.`
+							: "OAuth grants are in memory only; set HEVY_MCP_OAUTH_STORE_PATH to keep clients connected across restarts.",
+				);
+			}
 			return {
 				target: handle,
 				onShutdown: () => {
