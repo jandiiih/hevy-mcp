@@ -630,4 +630,80 @@ describe("Streamable HTTP server", () => {
 			),
 		).rejects.toThrow("HEVY_MCP_HTTP_BEARER_TOKEN");
 	});
+
+	it("answers the health probe without touching a session", async () => {
+		const { port } = await startTestServer();
+		const response = await fetch(`http://127.0.0.1:${port}/healthz`);
+		expect(response.status).toBe(200);
+		expect(await response.json()).toEqual({ status: "ok" });
+	});
+
+	it("serves the MCP endpoint on the legacy /mcp-v1 path too", async () => {
+		const { port } = await startTestServer();
+		const response = await fetch(`http://127.0.0.1:${port}/mcp-v1`, {
+			method: "POST",
+			headers: {
+				"Content-Type": "application/json",
+				Accept: "application/json, text/event-stream",
+			},
+			body: JSON.stringify({
+				jsonrpc: "2.0",
+				id: 1,
+				method: "initialize",
+				params: {
+					protocolVersion: "2025-06-18",
+					capabilities: {},
+					clientInfo: { name: "test-client", version: "1.0.0" },
+				},
+			}),
+		});
+		expect(response.status).toBe(200);
+		expect(response.headers.get("mcp-session-id")).toBeTruthy();
+		await response.body?.cancel();
+	});
+
+	it("still refuses an unknown path", async () => {
+		const { port } = await startTestServer();
+		expect((await fetch(`http://127.0.0.1:${port}/nope`)).status).toBe(404);
+	});
+
+	it("answers a Claude web preflight and blocks an unlisted origin", async () => {
+		const { port } = await startTestServer();
+		const allowed = await fetch(`http://127.0.0.1:${port}/mcp`, {
+			method: "OPTIONS",
+			headers: {
+				Origin: "https://claude.ai",
+				"Access-Control-Request-Method": "POST",
+			},
+		});
+		expect(allowed.status).toBe(204);
+		expect(allowed.headers.get("access-control-allow-origin")).toBe(
+			"https://claude.ai",
+		);
+		expect(allowed.headers.get("access-control-expose-headers")).toContain(
+			"Mcp-Session-Id",
+		);
+
+		const blocked = await fetch(`http://127.0.0.1:${port}/mcp`, {
+			method: "OPTIONS",
+			headers: {
+				Origin: "https://evil.example",
+				"Access-Control-Request-Method": "POST",
+			},
+		});
+		expect(blocked.status).toBe(403);
+	});
+
+	it("blocks a non-preflight request from an unlisted origin", async () => {
+		const { port } = await startTestServer();
+		const response = await fetch(`http://127.0.0.1:${port}/mcp`, {
+			method: "POST",
+			headers: {
+				"Content-Type": "application/json",
+				Origin: "https://evil.example",
+			},
+			body: "{}",
+		});
+		expect(response.status).toBe(403);
+	});
 });

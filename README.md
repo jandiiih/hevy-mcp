@@ -550,7 +550,11 @@ self-hosted Streamable HTTP.
 | `HEVY_API_KEY`                   | None; required                   | Local stdio or HTTP           | Hevy API key from the Hevy app. Never pass it in a URL.                                                        |
 | `HEVY_MCP_API_TIMEOUT`           | `30000` ms                       | Local stdio                   | Positive Hevy API timeout in milliseconds. Invalid values fall back to 30 seconds.                             |
 | `HEVY_MCP_DEBUG`                 | Disabled                         | Local Node                    | Set to exactly `1` for privacy-bounded diagnostics on stderr. Stdout remains reserved for MCP JSON-RPC.        |
-| `HEVY_MCP_HTTP_BEARER_TOKEN`     | None                             | Non-loopback HTTP             | Required when `--host` is not loopback; use a separate token, never the Hevy API key.                          |
+| `HEVY_MCP_HTTP_BEARER_TOKEN`     | None                             | Non-loopback HTTP             | Required when `--host` is not loopback and OAuth is off; use a separate token, never the Hevy API key.         |
+| `HEVY_MCP_OAUTH`                 | Disabled                         | Node HTTP                     | Set to `1` to serve OAuth 2.1 so remote clients such as Claude connectors can authorize themselves.            |
+| `HEVY_MCP_OAUTH_STORE_PATH`      | None; in memory                  | Node HTTP with OAuth          | File path for grant persistence, so a restart does not disconnect connected clients.                           |
+| `HEVY_MCP_PUBLIC_URL`            | Derived from proxy headers       | Node HTTP                     | Public `https://` origin behind a TLS-terminating proxy. Also pins the accepted `Host` header.                 |
+| `HEVY_MCP_ALLOWED_ORIGINS`       | Claude, ChatGPT, and web editors | Node HTTP                     | Comma-separated exact-origin allowlist for browser clients. Wildcards are unsupported.                         |
 | `HEVY_MCP_HTTP_MAX_SESSIONS`     | `100`                            | Local HTTP                    | Maximum established sessions, including sessions currently initializing; excess requests receive `429`.        |
 | `HEVY_MCP_HTTP_MAX_INITIALIZING` | `10`                             | Local HTTP                    | Maximum concurrent session initializations; excess requests receive `503` and are not queued.                  |
 | `HEVY_MCP_HTTP_IDLE_TIMEOUT_MS`  | `1800000` ms                     | Local HTTP                    | Idle sessions are evicted after 30 minutes; each session request resets the timer.                             |
@@ -582,6 +586,43 @@ docker run --rm -p 3000:3000 -e HEVY_API_KEY -e HEVY_MCP_HTTP_BEARER_TOKEN \\
 This Node HTTP mode is distinct from the stateless Cloudflare Worker HTTP
 endpoint described above: the Node server owns stateful client sessions, while
 the Worker is designed for hosted deployment and does not import Node code.
+
+### Remote Node deployment for Claude connectors
+
+A Node HTTP deployment can serve Claude custom connectors directly, without
+Cloudflare. Claude connects from a browser origin and cannot attach a fixed
+`Authorization` header, so the deployment needs OAuth and CORS:
+
+```bash
+HEVY_MCP_OAUTH=1 HEVY_MCP_PUBLIC_URL=https://your-app.example.com   npx hevy-mcp --transport http --host 0.0.0.0 --port 8080
+```
+
+With `HEVY_MCP_OAUTH=1` the server does not need its own `HEVY_API_KEY`. Each
+user pastes their key once on the server's `/authorize` consent page; it is
+validated with Hevy, sealed against that grant's token secret, and used only
+for that user's sessions. The server exposes:
+
+| Path                                        | Purpose                                        |
+| ------------------------------------------- | ---------------------------------------------- |
+| `/mcp`                                      | Streamable HTTP MCP endpoint (`/mcp-v1` alias) |
+| `/healthz`                                  | Liveness probe for the hosting platform        |
+| `/.well-known/oauth-protected-resource/mcp` | RFC 9728 resource metadata                     |
+| `/.well-known/oauth-authorization-server`   | RFC 8414 authorization server metadata         |
+| `/register`                                 | RFC 7591 dynamic client registration           |
+| `/authorize`                                | Consent page where the Hevy key is entered     |
+| `/token`                                    | PKCE token exchange and refresh                |
+
+Access tokens last 7 days and refresh tokens 30 days, matching the Worker.
+Grants live in memory unless `HEVY_MCP_OAUTH_STORE_PATH` points at a durable
+path, so without it a restart requires reconnecting the connector. Because that
+store is per-process, run a single replica.
+
+Clients that _can_ send a fixed header — Claude Code, Codex, other CLI clients
+— may skip the OAuth flow entirely and present the Hevy API key directly as
+`Authorization: Bearer <HEVY_API_KEY>` against the same endpoint.
+
+See [docs/railway-deployment.md](docs/railway-deployment.md) for a
+step-by-step Railway deployment.
 
 ### Cache behavior
 

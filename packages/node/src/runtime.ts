@@ -8,7 +8,17 @@ import { createHevyMcpServer, mergeAbortSignals } from "@hevy-mcp/core";
 import { createHevyClient, isHevyHttpError } from "@hevy-mcp/hevy-client";
 import { assertApiKey, parseConfig } from "./utils/config.js";
 import { parseNodeCliOptions, type NodeTransport } from "./utils/arguments.js";
-import { startStreamableHttpServer } from "./utils/streamable-http.js";
+import {
+	MCP_PATH,
+	startStreamableHttpServer,
+} from "./utils/streamable-http.js";
+import { configuredPublicOrigin } from "./utils/http-public-url.js";
+import {
+	HevyOAuthProvider,
+	OAuthStore,
+	resolveOAuthConfig,
+	type ApiKeyValidation,
+} from "./utils/oauth/index.js";
 import {
 	createNodeCacheObserver,
 	createNodeHevyClientOptions,
@@ -61,9 +71,17 @@ const HELP_TEXT = [
 	"  HEVY_MCP_TELEMETRY=0     Disable all project telemetry",
 	"  HEVY_MCP_TELEMETRY_DIAGNOSTICS=0  Suppress exception details",
 	"",
+	"Remote HTTP deployment (Claude connectors and other remote clients):",
+	"  HEVY_MCP_OAUTH=1           Serve OAuth 2.1; each user supplies their key",
+	"  HEVY_MCP_OAUTH_STORE_PATH  Persist grants across restarts",
+	"  HEVY_MCP_PUBLIC_URL        Public https origin behind a proxy",
+	"  HEVY_MCP_ALLOWED_ORIGINS   Comma-separated browser origin allowlist",
+	"",
 	"Examples:",
 	"  HEVY_API_KEY=your-key npx hevy-mcp",
 	"  HEVY_API_KEY=your-key npx hevy-mcp --transport http --port 3000",
+	"  HEVY_MCP_OAUTH=1 HEVY_MCP_PUBLIC_URL=https://example.up.railway.app \\",
+	"    npx hevy-mcp --transport http --host 0.0.0.0 --port 8080",
 ].join("\n");
 
 function getCliAction(args: string[]): "start" | "version" | "help" {
@@ -188,6 +206,40 @@ async function validateApiKey(apiKey: string, signal?: AbortSignal) {
 				? `${API_KEY_VALIDATION_WARNING} Diagnostic: ${diagnostic}.`
 				: API_KEY_VALIDATION_WARNING,
 		);
+	}
+}
+
+/**
+ * Classify a Hevy API key without the warn-and-continue behavior of the
+ * startup probe. The OAuth consent page needs a definite verdict: it must not
+ * seal a grant around a key Hevy would reject, and it must tell the user when
+ * Hevy is simply unreachable rather than blaming their key.
+ */
+async function classifyApiKey(
+	apiKey: string,
+	signal?: AbortSignal,
+): Promise<ApiKeyValidation> {
+	const probeClient = createHevyClient({
+		apiKey,
+		baseUrl: HEVY_API_BASEURL,
+		maxGetRetries: 0,
+		timeoutMs: STARTUP_PROBE_TIMEOUT_MS,
+	});
+	try {
+		await probeClient.getUserInfo({
+			signal,
+			deadline: Date.now() + STARTUP_PROBE_TIMEOUT_MS,
+		});
+		return "valid";
+	} catch (caughtError) {
+		const parsedError = validationErrorSchema.safeParse(caughtError);
+		const error: ValidationError = isHevyHttpError(caughtError)
+			? caughtError
+			: parsedError.success
+				? parsedError.data
+				: String(caughtError);
+		const status = getHttpStatus(error);
+		return status === 401 || status === 403 ? "invalid" : "unavailable";
 	}
 }
 
@@ -340,30 +392,76 @@ export async function runServer(): Promise<void> {
 		return;
 	}
 
+	const oauthConfig = resolveOAuthConfig(process.env);
+
 	await runNodeLifecycle({
 		transport: "http",
 		start: async (context) => {
 			const { signal } = context;
 			const cfg = parseConfig(process.env);
-			assertApiKey(cfg.apiKey);
-			await validateApiKey(cfg.apiKey, signal);
+			// With OAuth on, each session's key arrives from the user's grant, so
+			// the server itself does not hold one. Without OAuth the server still
+			// acts for a single configured account.
+			if (!oauthConfig.enabled) {
+				assertApiKey(cfg.apiKey);
+				await validateApiKey(cfg.apiKey, signal);
+			}
+
+			const store = oauthConfig.enabled
+				? new OAuthStore({ persistencePath: oauthConfig.storePath })
+				: undefined;
+			const oauth = store
+				? new HevyOAuthProvider({
+						store,
+						resourcePath: MCP_PATH,
+						validateApiKey: (candidate) => classifyApiKey(candidate, signal),
+					})
+				: undefined;
+			// Expired grants would otherwise linger for their full refresh
+			// lifetime; sweeping hourly keeps the store bounded.
+			const sweepTimer = store
+				? setInterval(() => store.sweep(), 60 * 60 * 1000)
+				: undefined;
+			sweepTimer?.unref?.();
+
 			const handle = await startStreamableHttpServer(
 				options,
-				cfg.apiKey,
-				(params) =>
-					Promise.resolve(
-						buildServer(
-							params.apiKey,
-							"http",
-							mergeAbortSignals(signal, params.lifecycleSignal),
-						),
-					),
+				cfg.apiKey ?? "",
+				oauthConfig.enabled
+					? (params) =>
+							createNodeMcpServer(
+								{ apiKey: params.apiKey },
+								"http",
+								mergeAbortSignals(signal, params.lifecycleSignal),
+							)
+					: (params) =>
+							Promise.resolve(
+								buildServer(
+									params.apiKey,
+									"http",
+									mergeAbortSignals(signal, params.lifecycleSignal),
+								),
+							),
+				{},
+				{
+					oauth,
+					publicOrigin: configuredPublicOrigin(process.env),
+					// Non-browser clients can present their Hevy key directly rather
+					// than completing an authorization flow they cannot render.
+					allowDirectApiKeyBearer: oauthConfig.enabled,
+				},
 			);
 			context.markListening();
 			console.error(
-				`Starting MCP server in HTTP mode at ${options.host}:${options.port}/mcp`,
+				`Starting MCP server in HTTP mode at ${options.host}:${options.port}${MCP_PATH}` +
+					(oauthConfig.enabled ? " with OAuth 2.1 enabled" : ""),
 			);
-			return { target: handle };
+			return {
+				target: handle,
+				onShutdown: () => {
+					if (sweepTimer) clearInterval(sweepTimer);
+				},
+			};
 		},
 		onFailure: (_reason, outcome) => {
 			if (outcome.transport === "http") {
